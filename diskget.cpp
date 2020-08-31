@@ -1,0 +1,383 @@
+/*
+ * diskget.cpp
+ * CSC 360 - Fall 2019 - P3 Part 3
+ * 
+ * Author: Cameron Wilson
+ * Created on: 2019-11-22
+ * 
+ * Copy a file from a disk image's file system, 
+ * and then write it to your local machine.
+ * 
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <bits/stdc++.h> 
+#include <unistd.h>
+
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+using namespace std;
+
+// Data structure for storing superblock info
+// taken from tutorial slides
+struct __attribute__((__packed__)) superblock_t {
+ uint8_t fs_id [8];
+ uint16_t block_size;
+ uint32_t file_system_block_count;
+ uint32_t fat_start_block;
+ uint32_t fat_block_count;
+ uint32_t root_dir_start_block;
+ uint32_t root_dir_block_count;
+};
+
+// Date & Time entry for file/directory taken from tutorial slides (Tutorial 10)
+struct __attribute__((__packed__)) dir_entry_timedate_t {
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
+};
+
+// Directory entry taken from tutorial slides (Tutorial 10)
+struct __attribute__((__packed__)) dir_entry_t {
+    uint8_t                       status;
+    uint32_t                      starting_block;
+    uint32_t                      block_count;
+    uint32_t                      size;
+    struct   dir_entry_timedate_t modify_time;
+    struct   dir_entry_timedate_t create_time;
+    char                          filename[31];
+    uint8_t                       unused[6];
+};
+
+
+
+
+
+
+#define FILENAME_MAXSIZE 31
+#define DIR_ENTRYSIZE 64  // bytes
+
+/* Files may either be directories or regular files. */
+#define FTYPE_FILE 0
+#define FTYPE_DIR  1
+#define FAT_ENTRY_SIZE 4
+
+
+int
+ReadBlock(int diskfd, int blockNum, const superblock_t *superblock, 
+            void* buf, int size) {
+
+
+    uint32_t block_size = superblock->block_size;
+
+    int superblock_size = 512;
+
+    int block_size_num_product = ((blockNum - 1) * block_size);
+
+    // Seek to block position (superblock is 0th block)
+    int blockOffset = superblock_size + block_size_num_product;
+    if (lseek(diskfd, blockOffset, SEEK_SET) != blockOffset) {
+        cout << "lseek error. ReadBlock function has failed" << endl;
+        return -1;
+    }
+
+    // Read block into buffer
+    if (read(diskfd, buf, size) != size) {
+        return -1;
+    }
+
+    return 0;
+
+}
+
+
+uint32_t *
+ReadFAT(int diskfd, const superblock_t *superblock, int *numFATEntries) {
+
+    // Calculate number of entries in FAT
+    uint32_t fat_count = superblock->fat_block_count;
+    uint32_t block_size = superblock->block_size;
+
+    *numFATEntries = (fat_count * block_size) 
+                    / FAT_ENTRY_SIZE;
+
+    // Allocate FAT entries
+    uint32_t* fat;
+    if (!(fat = (uint32_t*) malloc(*numFATEntries * sizeof(uint32_t)))) {
+        
+        cout << "Error in allocating FAT entries!" << endl;
+        return NULL;
+    }
+
+    // Read FAT blocks
+    int offset = 0;
+    for (int i = superblock->fat_start_block; 
+            i < (int) superblock->fat_start_block + (int) superblock->fat_block_count; 
+            i++) {
+
+        ReadBlock(diskfd, i, superblock, fat + offset, block_size);
+        offset += block_size;
+
+    }
+
+    // Reverse bit endianness on all FAT entries
+    for (int i = 0; i < *numFATEntries; i++) {
+        fat[i] = ntohl(fat[i]);
+    }
+
+    return fat;
+
+}
+
+
+dir_entry_t *
+ReadDir(int dirBlock, int *numEntries, const superblock_t *superblock, int diskfd) {
+
+    // Read directory block
+    char dirbuf[superblock->block_size];
+
+    if (ReadBlock(diskfd, dirBlock, superblock, dirbuf, 
+                    superblock->block_size) != 0) {
+        perror("Error reading directory block");
+        return NULL;
+    }
+
+    int maxEntries = superblock->block_size / 64;
+
+    dir_entry_t *dir_ent;
+    if (!(dir_ent = (dir_entry_t*)malloc(maxEntries * sizeof(dir_entry_t)))) {
+        cout << "Error: malloc. Cannot allocate space for directory entry. Abort from ReadDir function" << endl;
+        return NULL;
+    }
+
+    // Copy directory entries
+    int i;
+    *numEntries = 0;  // number of entries recorded so far
+    for (i = 0; i < maxEntries; i++) {
+
+        dir_entry_t *file = &(dir_ent[*numEntries]);
+
+        // Status byte
+        char file_status = dirbuf[(i * 64)];
+
+        if ((file_status & 0x01) == 0)                      // Entry unused
+            continue;
+
+        else if (file_status & 0x02)                        // Type is DIRECTORY
+            file->status = 0;
+
+        else if (file_status & 0x04)                        // Type is FILE
+            file->status = 1;
+
+        // Starting block (offset 1)
+        memcpy(&(file->starting_block), dirbuf + (i * 64) + 1, 4);
+        
+        // Number of blocks (offset 5)
+        memcpy(&file->block_count, dirbuf + (i * 64) + 5, 4);
+        
+        // File size (offset 9)
+        memcpy(&file->size, dirbuf + (i * 64) + 9, 4);
+    
+        memcpy(&file->create_time, dirbuf + (i * 64) + 13, 7);
+        
+        memcpy(&file->modify_time, dirbuf + (i * 64) + 20, 7);
+
+        // Convert to host byte order
+        file->starting_block = ntohl(file->starting_block);
+        file->size = ntohl(file->size);
+        file->create_time.year = ntohs(file->create_time.year);
+        file->modify_time.year = ntohs(file->modify_time.year);
+
+        // File name (offset 27)
+        strncpy(file->filename, (char*)dirbuf + (i * 64) + 27, 31);
+
+        (*numEntries)++;
+
+    }
+
+    return dir_ent;
+
+}
+
+unsigned int
+FindInDirectory(char *name, int startBlock, uint32_t *fat, dir_entry_t *file, 
+                    const superblock_t *superblock, int diskfd) {
+
+    int numEntries;
+    
+    dir_entry_t *files;
+
+    while (true) {
+        
+
+        files = ReadDir(startBlock, &numEntries, superblock, diskfd);
+
+        if (files == NULL) {
+            return 0xFFFFFFFF;
+        }
+            
+        for (int i = 0; i < numEntries; i++) {
+
+            char* filename = files[i].filename;
+
+            if (strcmp(filename, name) == 0) {
+
+                size_t dir_entry_size = sizeof(dir_entry_t);
+
+                memcpy(file, &files[i], dir_entry_size);
+                free(files);
+                return startBlock;
+            }
+
+        }
+
+        free(files);
+
+        if (fat[startBlock] == 0xFFFFFFFF) {
+            break;
+        }
+            
+
+        startBlock = fat[startBlock];
+
+    }
+
+    return 0xFFFFFFFF;
+
+}
+
+
+int main(int argc, char* argv[]) {
+
+    if (argc != 4) {
+        printf("You have provided %d arguments," 
+               "which is an invald number of arguments.\n"
+               "Refer to usage instructions below for how to use this program", argc);
+        printf("Usage: diskget <IMAGE FILE> <FILE IN FILE SYSTEM> <OUTPUT FILE NAME>\n");
+        return -1;
+    }
+
+    // Open file
+    int diskfd;
+    if ((diskfd = open(argv[1], O_RDWR)) == -1) {
+        return -1;
+    }
+
+    struct stat buffer;
+    fstat(diskfd, &buffer);
+
+    
+    // Get address in disk image file via memory map
+    // 0x01 = PROT_READ -> Pages may be read
+    // 0x02 = PROT_WRITE -> Pages may be written
+    // 0x001 = MAP_SHARED -> Share the map
+    // For more information, consult the documentation: http://man7.org/linux/man-pages/man2/mmap.2.html
+    char* address = (char*)mmap(NULL, buffer.st_size, 0x01 | 0x02, 0x001, diskfd, 0);
+
+    // Check that the file system identifier matches 'CSC360FS'
+    if (strncmp("CSC360FS", address, 8) != 0) {
+        fprintf(stderr, "Error: incompatible disk image format.\n");
+        return -1;
+    }
+
+    // Retrieve root directory info from disk image
+    superblock_t superblock;
+    size_t size_t_of_superblock = sizeof(superblock);
+    memcpy(&superblock, address, size_t_of_superblock);
+
+    // Convert from Big Endian to Little Endian
+    uint16_t blocksize = ntohs(superblock.block_size);
+    uint32_t root_dir_start_block = ntohl(superblock.root_dir_start_block);
+    uint32_t root_dir_block_count = ntohl(superblock.root_dir_block_count);
+    uint32_t fat_start_block = ntohl(superblock.fat_start_block);
+    uint32_t fat_block_count = ntohl(superblock.fat_block_count);
+    uint32_t file_system_block_count = ntohl(superblock.file_system_block_count);
+    
+    
+    //Assign converted values to struct
+    superblock.block_size = blocksize;
+    superblock.root_dir_start_block = root_dir_start_block;
+    superblock.root_dir_block_count = root_dir_block_count; 
+    superblock.fat_start_block = fat_start_block;
+    superblock.fat_block_count = fat_block_count;
+    superblock.file_system_block_count = file_system_block_count;
+
+
+    // Read FAT
+    int numFATEntries;
+    uint32_t *fat = ReadFAT(diskfd, &superblock, &numFATEntries);
+
+    // Find specified file in root directory
+    dir_entry_t file;
+    char *file_system_file = argv[2];
+    unsigned int blockNum = FindInDirectory(file_system_file, superblock.root_dir_start_block, fat, 
+                                              &file, &superblock, diskfd);
+    
+    if (blockNum == 0xFFFFFFFF) {
+        cout << "File not found\n" << endl;
+        return -1;
+    }
+
+    // Write file contents to output
+    int outFile;
+    if ((outFile = open(argv[3], O_CREAT|O_RDWR, 0777)) == -1) {
+        cout << "Error creating local ouput file" << endl;
+        return -1;
+    }
+
+    char outBuf[superblock.block_size];
+    int curBlock = file.starting_block;
+    unsigned int bytesTransferred = 0;
+    uint32_t file_size = file.size;
+    while (bytesTransferred < file_size) {
+
+        // Calculate number of bytes to write from block
+        int numBytes;
+
+        int bytes_transferred_block_size_product = bytesTransferred / superblock.block_size;
+        int file_size_block_size_product = file_size / superblock.block_size;
+
+        if (bytes_transferred_block_size_product != file_size_block_size_product) {
+            numBytes = superblock.block_size;
+        }
+        else {
+            numBytes = file_size % superblock.block_size;
+        }
+
+        // Read from current block
+        int read_block_boolean = ReadBlock(diskfd, curBlock, &superblock, outBuf, numBytes);
+        if (read_block_boolean == -1) {
+            break;
+        }
+     
+        // Write to output file
+        if (write(outFile, outBuf, numBytes) != numBytes) {
+            cout << "Error writing to local ouput file" << endl;
+            return -1;
+        }
+
+        curBlock = fat[curBlock];
+        bytesTransferred += numBytes;
+
+    }
+
+    free(fat);
+
+    close(diskfd);
+    close(outFile);
+
+    return 0;
+
+}
